@@ -1,0 +1,20 @@
+{
+  "network": "arbitrum-one",
+  "chainId": 42161,
+  "market": "USDT_WBTC",
+  "kind": "aave-softbands",
+  "pool": "0x5081399963fAe1EC5E519D0164c7f88208306b1c",
+  "positionNFT": "0x401CfB51EeAdbBb136D44B9B682e8b8b14bBea11",
+  "oracle": "0x61bF4B799210681326128C820912B8305aD8557E",
+  "aavePool": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+  "collateral": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+  "debt": "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f",
+  "owner": "0x6bf90c199205a7B1ae4C9b6172CbE0a073aC2A8F",
+  "collateralSymbol": "USDT",
+  "debtSymbol": "WBTC",
+  "collateralDecimals": 6,
+  "debtDecimals": 8,
+  "modules": {
+    "helper": "0x4099AB6670E449f33633942B92f12730cD94C270"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "openlend-solver-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenLend Softbands public solver bot",
+  "license": "BUSL-1.1",
+  "scripts": {
+    "start": "node -r ts-node/register/transpile-only softSolver.ts",
+    "once": "SOLVER_ONCE=1 node -r ts-node/register/transpile-only softSolver.ts",
+    "dry": "DRY_RUN=1 SOLVER_ONCE=1 node -r ts-node/register/transpile-only softSolver.ts",
+    "deploy:flash-solver": "node -r ts-node/register/transpile-only deployFlashSolver.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@types/node": "^24.0.0",
+    "dotenv": "^17.4.2",
+    "ethers": "^6.16.0",
+    "solc": "0.8.26",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "tmp": "^0.2.6",
+    "ws": "^8.20.1"
+  }
+}
