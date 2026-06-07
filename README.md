@@ -6,6 +6,8 @@ The bot watches the Softbands oracle/cursor gap and executes:
 
 - soft liquidation fills: `fill`
 - soft de-liquidation fills: `fillUp`
+- empty-range cursor syncs when the pool cursor is stale but no active
+  liquidity is currently being settled
 - optional hard liquidations: `liquidate`
 
 The recommended live path is flash mode. Each operator must deploy their own
@@ -82,11 +84,20 @@ SOLVER_EXECUTION_MODE=flash
 SOLVER_POLL_MS=10000
 RPC_REQUEST_TIMEOUT_MS=15000
 SOLVER_MIN_PROFIT_DEBT=0.000001
+SOLVER_ENABLE_EMPTY_CURSOR_SYNC=1
+SOLVER_EMPTY_CURSOR_SYNC_MAX_TICKS=5000
 ```
 
 `profitOnly` skips fills that do not produce positive simulated flash profit.
 `aggressive` allows non-profitable fills and is mostly useful for testing,
 operations, or direct mode.
+
+Empty cursor sync is enabled by default. When a market has an oracle/cursor gap
+above the pool threshold, active liquidity is zero, and `fill` / `fillUp`
+simulates with zero token movement, the bot sends a direct 1-raw-unit capped
+cursor-sync transaction and posts a Telegram notification. If the simulation
+would move any collateral or debt, the bot falls back to the normal flash-fill
+path.
 
 ## Direct Mode
 

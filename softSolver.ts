@@ -142,6 +142,17 @@ type FlashEvent = {
   profit: bigint;
 };
 
+type CursorSyncResult = {
+  direction: Direction;
+  oldTick: number;
+  newTick: number;
+  debtOut: bigint;
+  collateralIn: bigint;
+  collateralOut: bigint;
+  debtIn: bigint;
+  lossAccrued: bigint;
+};
+
 const ORACLE_ABI = [
   "function getPrice(address) view returns (uint256)",
 ];
@@ -434,6 +445,22 @@ function fillCapForFlash(
 function minProfitDebtFor(market: MarketRuntime): bigint {
   const raw = marketEnv("SOLVER_MIN_PROFIT_DEBT", market) ?? "0.000001";
   return parseUnits(raw, market.deployment.debtDecimals);
+}
+
+function emptyCursorSyncEnabled(market: MarketRuntime): boolean {
+  const raw = marketEnv("SOLVER_ENABLE_EMPTY_CURSOR_SYNC", market);
+  if (raw == null || raw === "") return true;
+  return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
+}
+
+function emptyCursorSyncMaxTicks(market: MarketRuntime): number {
+  const raw = marketEnv("SOLVER_EMPTY_CURSOR_SYNC_MAX_TICKS", market);
+  if (raw == null || raw === "") return 5000;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error("SOLVER_EMPTY_CURSOR_SYNC_MAX_TICKS must be a non-negative integer");
+  }
+  return parsed;
 }
 
 function uniswapFeeFor(markets: string[]): number {
@@ -1485,6 +1512,39 @@ function buildTelegramMessage(
   ].join("\n");
 }
 
+function buildCursorSyncTelegramMessage(
+  market: MarketRuntime,
+  sync: CursorSyncResult,
+  txHash: string,
+  gap: bigint
+): string {
+  const d = market.deployment;
+  const txUrl = d.chainId === 42161
+    ? `https://arbiscan.io/tx/${txHash}`
+    : `tx:${txHash}`;
+  const action = sync.direction === "down" ? "empty cursor sync fill" : "empty cursor sync fillUp";
+  const flow = sync.direction === "down"
+    ? [
+        `fill out: ${formatToken(sync.collateralOut, d.collateralDecimals, d.collateralSymbol)}`,
+        `fill in: ${formatToken(sync.debtIn, d.debtDecimals, d.debtSymbol)}`,
+      ]
+    : [
+        `fill out: ${formatToken(sync.debtOut, d.debtDecimals, d.debtSymbol)}`,
+        `fill in: ${formatToken(sync.collateralIn, d.collateralDecimals, d.collateralSymbol)}`,
+      ];
+
+  return [
+    `<b>OpenLend ${htmlEscape(marketLabel(market))} ${action}</b>`,
+    `pool: <code>${htmlEscape(shortAddress(d.pool))}</code>`,
+    `executor: <code>direct</code>`,
+    `ticks: <code>${sync.oldTick} -> ${sync.newTick}</code>`,
+    `gap: <code>${htmlEscape(formatBpsX18(gap))}</code>`,
+    ...flow.map((line) => htmlEscape(line)),
+    `loss: ${htmlEscape(formatToken(sync.lossAccrued, d.debtDecimals, d.debtSymbol))}`,
+    `<a href="${htmlEscape(txUrl)}">transaction</a>`,
+  ].join("\n");
+}
+
 function buildStatusTelegramMessage(
   status: "started" | "alive",
   address: string,
@@ -1644,6 +1704,95 @@ async function processHardLiquidations(market: MarketRuntime, liquidator: string
   }
 }
 
+async function processEmptyCursorSync(
+  market: MarketRuntime,
+  direction: Direction,
+  cursorTick: number,
+  oracleTick: number,
+  oracleSqrt: bigint,
+  gap: bigint
+): Promise<boolean> {
+  if (!emptyCursorSyncEnabled(market)) return false;
+
+  const label = marketLabel(market);
+  const currentLiquidity = BigInt(await market.pool.liquidity());
+  if (currentLiquidity !== 0n) return false;
+
+  const tickDistance = Math.abs(oracleTick - cursorTick);
+  const maxTicks = emptyCursorSyncMaxTicks(market);
+  if (maxTicks > 0 && tickDistance > maxTicks) {
+    console.log(`[${label}] skip empty cursor sync tickDistance=${tickDistance} maxTicks=${maxTicks}`);
+    return false;
+  }
+
+  const fn = direction === "down"
+    ? (market.pool as any).fill
+    : (market.pool as any).fillUp;
+
+  let zeroSettlement: boolean;
+  try {
+    const simulated = await fn.staticCall(1n, oracleSqrt, {
+      gasLimit: envInt("SOLVER_GAS_LIMIT", 30_000_000),
+    });
+    const first = BigInt(simulated[0]);
+    const second = BigInt(simulated[1]);
+    zeroSettlement = first === 0n && second === 0n;
+    if (!zeroSettlement) {
+      console.log(
+        `[${label}] skip empty cursor sync non-zero settlement ` +
+        `${direction === "down" ? "collateralOut" : "debtOut"}=${first} ` +
+        `${direction === "down" ? "debtIn" : "collateralIn"}=${second}`
+      );
+      return false;
+    }
+  } catch (e) {
+    console.log(`[${label}] skip empty cursor sync static call failed: ${errorMessage(e)}`);
+    if (envFlag("SOLVER_DEBUG_ERRORS")) console.error(debugErrorDetails(e));
+    return false;
+  }
+
+  const action = direction === "down" ? "fill" : "fillUp";
+  console.log(
+    `[${label}] ${envFlag("DRY_RUN") ? "dry-run " : ""}empty cursor sync ${action} ` +
+    `gap=${formatBpsX18(gap)} ticks=${cursorTick}->${oracleTick}`
+  );
+
+  if (envFlag("DRY_RUN")) return true;
+
+  const tx = await fn(1n, oracleSqrt, {
+    gasLimit: envInt("SOLVER_GAS_LIMIT", 30_000_000),
+  });
+  console.log(`[${label}] empty cursor sync tx=${tx.hash}`);
+  const receipt = await tx.wait();
+  if (!receipt || receipt.status !== 1) {
+    throw new Error(`${label} empty cursor sync failed: ${tx.hash}`);
+  }
+
+  const fillEvent = parseFillEvent(market, receipt);
+  if (!fillEvent) throw new Error(`${label} empty cursor sync receipt has no fill event: ${tx.hash}`);
+  if (fillEvent.direction !== direction) {
+    throw new Error(`${label} empty cursor sync emitted unexpected direction: ${tx.hash}`);
+  }
+
+  const sync: CursorSyncResult = {
+    direction,
+    oldTick: fillEvent.oldTick,
+    newTick: fillEvent.newTick,
+    debtOut: fillEvent.debtOut,
+    collateralIn: fillEvent.collateralIn,
+    collateralOut: fillEvent.collateralOut,
+    debtIn: fillEvent.debtIn,
+    lossAccrued: fillEvent.lossAccrued,
+  };
+  const message = buildCursorSyncTelegramMessage(market, sync, tx.hash, gap);
+  try {
+    await sendTelegramWithRetry(message);
+  } catch (e) {
+    console.error(`[${label}] Telegram notification failed: ${errorMessage(e)}`);
+  }
+  return true;
+}
+
 async function processMarket(market: MarketRuntime, recipient: string): Promise<void> {
   const d = market.deployment;
   const label = marketLabel(market);
@@ -1694,6 +1843,10 @@ async function processMarket(market: MarketRuntime, recipient: string): Promise<
   }
   if (direction === "up" && !envFlag("SOLVER_ENABLE_FILL_UP", true)) {
     console.log(`[${label}] skip fillUp disabled`);
+    return;
+  }
+
+  if (await processEmptyCursorSync(market, direction, cursorTick, oracleTick, oracleSqrt, gap)) {
     return;
   }
 
