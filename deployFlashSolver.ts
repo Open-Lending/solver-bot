@@ -72,10 +72,93 @@ function compileFlashSolver(): { abi: unknown[]; bytecode: string } {
   };
 }
 
-function rpcUrl(): string {
-  const url = process.env.ARBITRUM_RPC_URL || process.env.RPC_URL;
-  if (!url) throw new Error("Set ARBITRUM_RPC_URL in .env");
-  return url;
+function rpcUrls(): string[] {
+  const raw = process.env.ARBITRUM_RPC_URLS
+    || process.env.RPC_URLS
+    || process.env.ARBITRUM_RPC_URL
+    || process.env.RPC_URL;
+  if (!raw) throw new Error("Set ARBITRUM_RPC_URLS or ARBITRUM_RPC_URL in .env");
+
+  const urls = raw
+    .split(/[\s,]+/)
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+  if (urls.length === 0) throw new Error("ARBITRUM_RPC_URLS is empty");
+  return urls;
+}
+
+function rpcRequestTimeoutMs(): number {
+  const value = process.env.RPC_REQUEST_TIMEOUT_MS;
+  if (value == null || value === "") return 15_000;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error("RPC_REQUEST_TIMEOUT_MS must be a non-negative integer");
+  }
+  return parsed;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (timer) clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+class SequentialJsonRpcProvider extends JsonRpcProvider {
+  private readonly backends: JsonRpcProvider[];
+  private activeIndex = 0;
+
+  constructor(urls: string[]) {
+    super(urls[0]);
+    this.backends = urls.map((url) => new JsonRpcProvider(url));
+  }
+
+  async _send(payload: any): Promise<any[]> {
+    const timeoutMs = rpcRequestTimeoutMs();
+    let lastError: unknown;
+    const startIndex = this.activeIndex;
+
+    for (let offset = 0; offset < this.backends.length; offset++) {
+      const index = (startIndex + offset) % this.backends.length;
+      try {
+        const result = await withTimeout(
+          this.backends[index]._send(payload),
+          timeoutMs,
+          `RPC endpoint ${index + 1}/${this.backends.length}`,
+        );
+        this.activeIndex = index;
+        return result;
+      } catch (error) {
+        lastError = error;
+        this.activeIndex = (index + 1) % this.backends.length;
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[rpc] endpoint ${index + 1}/${this.backends.length} failed, trying next: ${message}`);
+      }
+    }
+
+    throw lastError;
+  }
+
+  destroy(): void {
+    for (const backend of this.backends) backend.destroy();
+    super.destroy();
+  }
+}
+
+function buildProvider(): JsonRpcProvider {
+  const urls = rpcUrls();
+  if (urls.length === 1) return new JsonRpcProvider(urls[0]);
+  return new SequentialJsonRpcProvider(urls);
 }
 
 function deployerWallet(provider: JsonRpcProvider): Wallet {
@@ -85,7 +168,7 @@ function deployerWallet(provider: JsonRpcProvider): Wallet {
 }
 
 async function main() {
-  const provider = new JsonRpcProvider(rpcUrl());
+  const provider = buildProvider();
   const deployer = deployerWallet(provider);
   const chainId = Number((await provider.getNetwork()).chainId);
   const poolDeployment = readPoolDeployment(chainId);

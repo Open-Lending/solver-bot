@@ -707,10 +707,82 @@ function assertSameAddress(label: string, actual: string, expected: string): voi
   }
 }
 
-function rpcUrl(): string {
-  const url = process.env.ARBITRUM_RPC_URL || process.env.RPC_URL;
-  if (!url) throw new Error("Set ARBITRUM_RPC_URL in .env");
-  return url;
+function rpcUrls(): string[] {
+  const raw = process.env.ARBITRUM_RPC_URLS
+    || process.env.RPC_URLS
+    || process.env.ARBITRUM_RPC_URL
+    || process.env.RPC_URL;
+  if (!raw) throw new Error("Set ARBITRUM_RPC_URLS or ARBITRUM_RPC_URL in .env");
+
+  const urls = raw
+    .split(/[\s,]+/)
+    .map((url) => url.trim())
+    .filter((url) => url.length > 0);
+  if (urls.length === 0) throw new Error("ARBITRUM_RPC_URLS is empty");
+  return urls;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (timer) clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+class SequentialJsonRpcProvider extends JsonRpcProvider {
+  private readonly backends: JsonRpcProvider[];
+  private activeIndex = 0;
+
+  constructor(urls: string[]) {
+    super(urls[0]);
+    this.backends = urls.map((url) => new JsonRpcProvider(url));
+  }
+
+  async _send(payload: any): Promise<any[]> {
+    const timeoutMs = envInt("RPC_REQUEST_TIMEOUT_MS", 15_000);
+    let lastError: unknown;
+    const startIndex = this.activeIndex;
+
+    for (let offset = 0; offset < this.backends.length; offset++) {
+      const index = (startIndex + offset) % this.backends.length;
+      try {
+        const result = await withTimeout(
+          this.backends[index]._send(payload),
+          timeoutMs,
+          `RPC endpoint ${index + 1}/${this.backends.length}`,
+        );
+        this.activeIndex = index;
+        return result;
+      } catch (error) {
+        lastError = error;
+        this.activeIndex = (index + 1) % this.backends.length;
+        console.warn(`[rpc] endpoint ${index + 1}/${this.backends.length} failed, trying next: ${errorMessage(error)}`);
+      }
+    }
+
+    throw lastError;
+  }
+
+  destroy(): void {
+    for (const backend of this.backends) backend.destroy();
+    super.destroy();
+  }
+}
+
+function buildProvider(): JsonRpcProvider {
+  const urls = rpcUrls();
+  if (urls.length === 1) return new JsonRpcProvider(urls[0]);
+  return new SequentialJsonRpcProvider(urls);
 }
 
 function solverWallet(provider: JsonRpcProvider): Wallet {
@@ -1692,7 +1764,7 @@ async function processMarket(market: MarketRuntime, recipient: string): Promise<
 
 export async function runSoftSolver(options: RunSoftSolverOptions = {}) {
   const startedAtMs = options.startedAtMs ?? Date.now();
-  const provider = options.provider ?? new JsonRpcProvider(rpcUrl());
+  const provider = options.provider ?? buildProvider();
   const solver = options.signer ?? solverWallet(provider);
   const network = await provider.getNetwork();
   const chainId = options.chainId ?? Number(network.chainId);
@@ -1740,7 +1812,7 @@ export async function runSoftSolver(options: RunSoftSolverOptions = {}) {
     `executor=${flashSolverAddress ?? "direct"}, profitRecipient=${recipient}, ` +
     `markets=${markets.map(marketLabel).join(",")}, mode=${solverMode()}, ` +
     `flashMode=${flashMode()}, executionMode=${executionMode()}, ` +
-    `dryRun=${envFlag("DRY_RUN")}`
+    `dryRun=${envFlag("DRY_RUN")}, rpcEndpoints=${options.provider ? "custom" : rpcUrls().length}`
   );
   for (const market of markets) {
     console.log(`[${marketLabel(market)}] uniswapPool=${market.uniswapPool}`);

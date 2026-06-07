@@ -33,10 +33,16 @@ cp .env.example .env
 Edit `.env`:
 
 ```bash
-ARBITRUM_RPC_URL=https://arb-mainnet.g.alchemy.com/v2/YOUR_KEY
+ARBITRUM_RPC_URLS=https://arb-mainnet.g.alchemy.com/v2/YOUR_PRIMARY_KEY,https://arb1.arbitrum.io/rpc
 PRIVATE_KEY=0xYOUR_SOLVER_WALLET_PRIVATE_KEY
 TELEGRAM_DISABLED=1
 ```
+
+`ARBITRUM_RPC_URLS` accepts a comma-separated failover list. Endpoints are tried
+by priority, and the bot falls through to the next one when the earlier backend
+is slow, rate-limited, or unavailable. A single `ARBITRUM_RPC_URL` still works.
+`RPC_REQUEST_TIMEOUT_MS` controls how long one backend may hang before the bot
+tries the next endpoint.
 
 ## Deploy Your Flash Solver
 
@@ -74,6 +80,7 @@ SOLVER_MODE=profitOnly
 SOLVER_FLASH_MODE=auto
 SOLVER_EXECUTION_MODE=flash
 SOLVER_POLL_MS=10000
+RPC_REQUEST_TIMEOUT_MS=15000
 SOLVER_MIN_PROFIT_DEBT=0.000001
 ```
 
