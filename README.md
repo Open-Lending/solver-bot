@@ -83,6 +83,7 @@ SOLVER_FLASH_MODE=auto
 SOLVER_EXECUTION_MODE=flash
 SOLVER_POLL_MS=10000
 RPC_REQUEST_TIMEOUT_MS=15000
+RPC_ALERT_COOLDOWN_MS=300000
 SOLVER_MIN_PROFIT_DEBT=0.000001
 SOLVER_ENABLE_EMPTY_CURSOR_SYNC=1
 SOLVER_EMPTY_CURSOR_SYNC_MAX_TICKS=5000
@@ -141,6 +142,11 @@ TELEGRAM_CHAT_ID=...
 ```
 
 Live mode requires either valid Telegram settings or `TELEGRAM_DISABLED=1`.
+When Telegram is enabled, the bot sends an RPC outage alert if every configured
+RPC endpoint fails in one provider request. Repeated outage alerts are
+rate-limited by `RPC_ALERT_COOLDOWN_MS`, and a recovery notification is sent
+when any endpoint starts responding again. Set `RPC_ALERTS_DISABLED=1` to
+disable only these RPC alerts.
 
 ## Safety Notes
 

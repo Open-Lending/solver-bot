@@ -766,6 +766,73 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+let rpcOutageActive = false;
+let lastRpcOutageAlertAtMs = 0;
+
+class RpcAllEndpointsFailedError extends Error {
+  readonly endpointCount: number;
+  readonly timeoutMs: number;
+  readonly originalError: unknown;
+
+  constructor(endpointCount: number, timeoutMs: number, originalError: unknown) {
+    super(`all configured RPC endpoints failed: ${errorMessage(originalError)}`);
+    this.name = "RpcAllEndpointsFailedError";
+    this.endpointCount = endpointCount;
+    this.timeoutMs = timeoutMs;
+    this.originalError = originalError;
+  }
+}
+
+function isRpcAllEndpointsFailedError(error: unknown): error is RpcAllEndpointsFailedError {
+  return error instanceof RpcAllEndpointsFailedError;
+}
+
+function rpcAlertsEnabled(): boolean {
+  return operationalNotificationsEnabled() && !envFlag("RPC_ALERTS_DISABLED");
+}
+
+function rpcAlertCooldownMs(): number {
+  return envDurationMs("RPC_ALERT_COOLDOWN_MS", 5 * 60 * 1000);
+}
+
+async function sendRpcAlert(message: string): Promise<void> {
+  if (!rpcAlertsEnabled()) return;
+  try {
+    await sendTelegramWithRetry(message);
+  } catch (e) {
+    console.error(`[telegram] RPC alert failed: ${errorMessage(e)}`);
+  }
+}
+
+async function notifyRpcOutage(endpointCount: number, timeoutMs: number, lastError: unknown): Promise<void> {
+  if (!rpcAlertsEnabled()) return;
+
+  const now = Date.now();
+  const shouldAlert = !rpcOutageActive || now - lastRpcOutageAlertAtMs >= rpcAlertCooldownMs();
+  rpcOutageActive = true;
+  if (!shouldAlert) return;
+
+  lastRpcOutageAlertAtMs = now;
+  await sendRpcAlert([
+    `<b>OpenLend soft solver RPC outage</b>`,
+    `all configured RPC endpoints failed`,
+    `endpoints: <code>${endpointCount}</code>`,
+    `per-endpoint timeout: <code>${timeoutMs}ms</code>`,
+    `error: <code>${htmlEscape(errorMessage(lastError))}</code>`,
+  ].join("\n"));
+}
+
+function notifyRpcRecovered(activeEndpointIndex: number, endpointCount: number): void {
+  if (!rpcOutageActive) return;
+  rpcOutageActive = false;
+  if (!rpcAlertsEnabled()) return;
+
+  void sendRpcAlert([
+    `<b>OpenLend soft solver RPC recovered</b>`,
+    `active endpoint: <code>${activeEndpointIndex + 1}/${endpointCount}</code>`,
+  ].join("\n"));
+}
+
 class SequentialJsonRpcProvider extends JsonRpcProvider {
   private readonly backends: JsonRpcProvider[];
   private activeIndex = 0;
@@ -789,6 +856,7 @@ class SequentialJsonRpcProvider extends JsonRpcProvider {
           `RPC endpoint ${index + 1}/${this.backends.length}`,
         );
         this.activeIndex = index;
+        notifyRpcRecovered(index, this.backends.length);
         return result;
       } catch (error) {
         lastError = error;
@@ -797,7 +865,8 @@ class SequentialJsonRpcProvider extends JsonRpcProvider {
       }
     }
 
-    throw lastError;
+    await notifyRpcOutage(this.backends.length, timeoutMs, lastError);
+    throw new RpcAllEndpointsFailedError(this.backends.length, timeoutMs, lastError);
   }
 
   destroy(): void {
@@ -808,7 +877,6 @@ class SequentialJsonRpcProvider extends JsonRpcProvider {
 
 function buildProvider(): JsonRpcProvider {
   const urls = rpcUrls();
-  if (urls.length === 1) return new JsonRpcProvider(urls[0]);
   return new SequentialJsonRpcProvider(urls);
 }
 
@@ -2017,8 +2085,27 @@ export async function runSoftSolver(options: RunSoftSolverOptions = {}) {
   } while (!once);
 }
 
+async function runSoftSolverCli(): Promise<void> {
+  const once = envFlag("SOLVER_ONCE");
+  for (;;) {
+    try {
+      await runSoftSolver();
+      return;
+    } catch (e: unknown) {
+      if (!isRpcAllEndpointsFailedError(e) || once) {
+        throw e;
+      }
+
+      const retryMs = envInt("SOLVER_POLL_MS", 10_000);
+      console.error(`[rpc] all configured RPC endpoints failed during startup; retrying in ${retryMs}ms`);
+      if (envFlag("SOLVER_DEBUG_ERRORS")) console.error(debugErrorDetails(e));
+      await sleep(retryMs);
+    }
+  }
+}
+
 if (require.main === module) {
-  runSoftSolver()
+  runSoftSolverCli()
     .then(() => process.exit(0))
     .catch((e: unknown) => {
       console.error(e);
